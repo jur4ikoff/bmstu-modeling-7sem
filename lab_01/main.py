@@ -13,6 +13,7 @@ from typing import Sequence
 TABLE_ROWS = 10
 DigitGroups = tuple[int, int, int]
 BENFORD_PROBABILITIES = tuple(log10(1 + 1 / digit) for digit in range(1, 10))
+VALUE_RANGES = ((0, 9), (0, 99), (0, 999)) * 2
 
 
 def generate_random_numbers(count: int) -> list[int]:
@@ -23,7 +24,7 @@ def generate_random_numbers(count: int) -> list[int]:
     return [randint(100_000, 999_999) for _ in range(count)]
 
 
-def benford_randomness_score(numbers: Sequence[int | float]) -> float:
+def benford_randomness_score(numbers: Sequence[int | float | str]) -> float:
     """Возвращает оценку соответствия закону Бенфорда от 0.0 до 1.0.
 
     Оценка основана на первых значащих цифрах ненулевых чисел. Значение 1.0
@@ -59,6 +60,127 @@ def benford_randomness_score(numbers: Sequence[int | float]) -> float:
     max_distance = 1 - min(BENFORD_PROBABILITIES)
 
     return max(0.0, min(1.0, 1 - total_variation_distance / max_distance))
+
+
+def order_score(
+    numbers: Sequence[int | float | str], lower_bound: int, upper_bound: int
+) -> float:
+    """Возвращает оценку порядка чисел с учётом обратных подпоследовательностей.
+
+    Для каждой непрерывной тройки чисел строится пара соседних разностей.
+    Одинаковые пары, а также пары, полученные при чтении тройки в обратном
+    направлении, считаются одним шаблоном. Длинные монотонные фрагменты и
+    повторяющиеся прямые или обратные подпоследовательности снижают оценку.
+    """
+    if lower_bound >= upper_bound:
+        raise ValueError("Нижняя граница должна быть меньше верхней")
+
+    lower = Decimal(lower_bound)
+    upper = Decimal(upper_bound)
+    values: list[Decimal] = []
+
+    for number in numbers:
+        try:
+            value = Decimal(str(number))
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError(f"Ожидалось число, получено: {number!r}") from error
+
+        if not value.is_finite():
+            raise ValueError(f"Число должно быть конечным, получено: {number!r}")
+        if not lower <= value <= upper:
+            raise ValueError(
+                f"Число {number!r} вне допустимого диапазона "
+                f"от {lower_bound} до {upper_bound}"
+            )
+        values.append(value)
+
+    if len(values) < 3:
+        return 0.0
+
+    patterns: set[tuple[Decimal, Decimal]] = set()
+    monotonic_triplets = 0
+    windows_count = len(values) - 2
+
+    for first, second, third in zip(values, values[1:], values[2:]):
+        first_difference = second - first
+        second_difference = third - second
+        if (first_difference > 0 and second_difference > 0) or (
+            first_difference < 0 and second_difference < 0
+        ):
+            monotonic_triplets += 1
+
+        pattern = (first_difference, second_difference)
+        reversed_pattern = (-second_difference, -first_difference)
+        patterns.add(min(pattern, reversed_pattern))
+
+    monotonic_score = 1 - monotonic_triplets / windows_count
+    subsequence_score = len(patterns) / windows_count
+    return monotonic_score * subsequence_score
+
+
+def variance_score(
+    numbers: Sequence[int | float | str], lower_bound: int, upper_bound: int
+) -> float:
+    """Возвращает близость дисперсии к равномерному распределению.
+
+    Для равномерно распределённых целых чисел от ``lower_bound`` до
+    ``upper_bound`` ожидаемая дисперсия равна ``(M ** 2 - 1) / 12``, где
+    ``M`` — число возможных значений. Точное совпадение с ней даёт 1.0;
+    при большем или меньшем разбросе оценка снижается до 0.0.
+    """
+    if lower_bound >= upper_bound:
+        raise ValueError("Нижняя граница должна быть меньше верхней")
+
+    lower = Decimal(lower_bound)
+    upper = Decimal(upper_bound)
+    values: list[Decimal] = []
+
+    for number in numbers:
+        try:
+            value = Decimal(str(number))
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError(f"Ожидалось число, получено: {number!r}") from error
+
+        if not value.is_finite():
+            raise ValueError(f"Число должно быть конечным, получено: {number!r}")
+        if not lower <= value <= upper:
+            raise ValueError(
+                f"Число {number!r} вне допустимого диапазона "
+                f"от {lower_bound} до {upper_bound}"
+            )
+        values.append(value)
+
+    if not values:
+        return 0.0
+
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    values_count = upper - lower + 1
+    expected_variance = (values_count**2 - 1) / 12
+    score = 1 - abs(variance - expected_variance) / expected_variance
+    return max(0.0, min(1.0, float(score)))
+
+
+def randomness_score(
+    numbers: Sequence[int | float | str], lower_bound: int, upper_bound: int
+) -> float:
+    """Возвращает составной коэффициент случайности от 0.0 до 1.0.
+
+    Критерий поровну учитывает соответствие закону Бенфорда, порядок чисел
+    и близость дисперсии к ожидаемой.
+    """
+    return sum(randomness_criteria(numbers, lower_bound, upper_bound)) / 3
+
+
+def randomness_criteria(
+    numbers: Sequence[int | float | str], lower_bound: int, upper_bound: int
+) -> tuple[float, float, float]:
+    """Возвращает значения трёх составляющих критерия случайности."""
+    return (
+        benford_randomness_score(numbers),
+        order_score(numbers, lower_bound, upper_bound),
+        variance_score(numbers, lower_bound, upper_bound),
+    )
 
 
 def read_file_data() -> list[str]:
@@ -106,15 +228,16 @@ def get_digit_groups(number: str | int) -> DigitGroups:
 
 def prepare_table_data(numbers: list[str | int]) -> list[DigitGroups]:
     """Подготавливает числа для таблицы в едином числовом формате."""
-    return [get_digit_groups(number) for number in numbers[:TABLE_ROWS]]
+    return [get_digit_groups(number) for number in numbers]
 
 
 def format_table(table_data: list[DigitGroups], generated_data: list[DigitGroups]) -> str:
     """Формирует таблицу табличного и алгоритмического способов."""
     rows = [
         from_file + generated
-        for from_file, generated in zip(table_data[:TABLE_ROWS], generated_data[:TABLE_ROWS])
+        for from_file, generated in zip(table_data, generated_data)
     ]
+    rows = rows[:TABLE_ROWS]
     if not rows:
         return "Нет корректных шестизначных чисел для построения таблицы."
 
@@ -155,13 +278,33 @@ def format_table(table_data: list[DigitGroups], generated_data: list[DigitGroups
         + "│"
     )
     middle = "├" + "┬".join("─" * (width + 2) for width in widths) + "┤"
-    column_scores = tuple(
-        f"{benford_randomness_score([values[index] for values in rows]):.4f}"
-        for index in range(6)
+    table_criteria = tuple(
+        randomness_criteria(
+            [values[index] for values in table_data], *VALUE_RANGES[index]
+        )
+        for index in range(3)
+    )
+    generated_criteria = tuple(
+        randomness_criteria(
+            [values[index] for values in generated_data], *VALUE_RANGES[index + 3]
+        )
+        for index in range(3)
+    )
+    criteria_by_column = table_criteria + generated_criteria
+    criteria_scores = tuple(
+        tuple(
+            f"{score:.4f}"
+            for score in criteria
+        )
+        for criteria in criteria_by_column
+    )
+    total_scores = tuple(
+        f"{sum(criteria) / 3:.4f}" for criteria in criteria_by_column
     )
     table_width = sum(widths) + 17
-    result_label = "Результат"
-    result_row = f"│ {'{0}'.format(result_label):^{table_width - 2}} │"
+    def result_row(label: str) -> str:
+        return f"│ {label:^{table_width - 2}} │"
+
     return "\n".join(
         [
             group_line,
@@ -172,9 +315,23 @@ def format_table(table_data: list[DigitGroups], generated_data: list[DigitGroups
             *(row(values) if index == len(rows) - 1 else row(values) + "\n" + middle
               for index, values in enumerate(rows)),
             middle,
-            result_row,
+            result_row("Результат"),
             middle,
-            row(column_scores),
+            result_row("Закон Бенфорда"),
+            middle,
+            row(tuple(scores[0] for scores in criteria_scores)),
+            middle,
+            result_row("Критерий порядка"),
+            middle,
+            row(tuple(scores[1] for scores in criteria_scores)),
+            middle,
+            result_row("Близость дисперсии к ожидаемой"),
+            middle,
+            row(tuple(scores[2] for scores in criteria_scores)),
+            middle,
+            result_row("Итоговый коэффициент"),
+            middle,
+            row(total_scores),
             line("└", "┴", "┘"),
         ]
     )
@@ -196,11 +353,17 @@ def main() -> None:
     args = parse_args()
     if args.manual:
         data = read_manual_data()
+        benford, order, variance = randomness_criteria(data, 0, 9)
+        score = (benford + order + variance) / 3
+        print(f"Закон Бенфорда: {benford:.4f}")
+        print(f"Критерий порядка: {order:.4f}")
+        print(f"Близость дисперсии к ожидаемой: {variance:.4f}")
+        print(f"Коэффициент случайности: {score:.4f}")
         return
 
     data = read_file_data()
     table_data = prepare_table_data(data)
-    generated_numbers = generate_random_numbers(TABLE_ROWS)
+    generated_numbers = generate_random_numbers(len(data))
     generated_data = prepare_table_data(generated_numbers)
     print(format_table(table_data, generated_data))
 
